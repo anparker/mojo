@@ -148,8 +148,8 @@ sub stop_gracefully {
 }
 
 sub stream {
-  my ($self, $stream, $server) = (_instance(shift), @_);
-  return $self->_stream($stream, $self->_id, $server) if ref $stream;
+  my ($self, $stream) = (_instance(shift), @_);
+  return $self->_stream($stream, $self->_id) if ref $stream;
   my $c = $self->{in}{$stream} || $self->{out}{$stream} || {};
   return $c->{stream};
 }
