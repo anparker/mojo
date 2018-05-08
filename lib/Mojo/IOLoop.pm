@@ -9,6 +9,7 @@ use Mojo::IOLoop::Delay;
 use Mojo::IOLoop::Server;
 use Mojo::IOLoop::Stream;
 use Mojo::IOLoop::Subprocess;
+use Mojo::Loader 'load_class';
 use Mojo::Reactor::Poll;
 use Mojo::Util qw(md5_sum steady_time);
 use Scalar::Util qw(blessed weaken);
@@ -110,7 +111,10 @@ sub server {
   weaken $self;
   $server->on(
     accept => sub {
-      my $stream = Mojo::IOLoop::Stream->new(pop);
+      my ($server, $handle) = @_;
+      my $class = $server->{args}{stream_class} || 'Mojo::IOLoop::Stream';
+      if (my $e = load_class $class) { die $e }
+      my $stream = $class->new($handle);
       $self->$cb($stream, $self->_stream($stream, $self->_id, 1));
 
       # Enforce connection limit (randomize to improve load balancing)
@@ -144,8 +148,8 @@ sub stop_gracefully {
 }
 
 sub stream {
-  my ($self, $stream) = (_instance(shift), @_);
-  return $self->_stream($stream => $self->_id) if ref $stream;
+  my ($self, $stream, $server) = (_instance(shift), @_);
+  return $self->_stream($stream, $self->_id, $server) if ref $stream;
   my $c = $self->{in}{$stream} || $self->{out}{$stream} || {};
   return $c->{stream};
 }

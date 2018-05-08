@@ -3,10 +3,7 @@ use Mojo::Base 'Mojo::Server';
 
 use Carp 'croak';
 use Mojo::IOLoop;
-use Mojo::Transaction::WebSocket;
 use Mojo::URL;
-use Mojo::Util 'term_escape';
-use Mojo::WebSocket 'server_handshake';
 use Scalar::Util 'weaken';
 
 use constant DEBUG => $ENV{MOJO_DAEMON_DEBUG} || 0;
@@ -16,13 +13,22 @@ has [qw(backlog max_clients silent)];
 has inactivity_timeout => sub { $ENV{MOJO_INACTIVITY_TIMEOUT} // 15 };
 has ioloop             => sub { Mojo::IOLoop->singleton };
 has listen => sub { [split ',', $ENV{MOJO_LISTEN} || 'http://*:3000'] };
-has max_requests => 100;
 
 sub DESTROY {
   return if Mojo::Util::_global_destruction();
   my $self = shift;
   my $loop = $self->ioloop;
   $loop->remove($_) for keys %{$self->{connections} || {}}, @{$self->acceptors};
+}
+
+sub max_requests {
+  my $self = shift;
+
+  return $self->{max_requests} //= 100 unless @_;
+
+  $self->{max_requests} = $_[0];
+  $_->max_requests($_[0]) for values %{$self->{connections} || {}};
+  return $self;
 }
 
 sub ports {
@@ -72,92 +78,13 @@ sub stop {
   return $self;
 }
 
-sub _build_tx {
-  my ($self, $id, $c) = @_;
-
-  my $tx = $self->build_tx->connection($id);
-  $tx->res->headers->server('Mojolicious (Perl)');
-  my $handle = $self->ioloop->stream($id)->handle;
-  unless ($handle->isa('IO::Socket::UNIX')) {
-    $tx->local_address($handle->sockhost)->local_port($handle->sockport);
-    $tx->remote_address($handle->peerhost)->remote_port($handle->peerport);
-  }
-  $tx->req->url->base->scheme('https') if $c->{tls};
-
-  weaken $self;
-  $tx->on(
-    request => sub {
-      my $tx = shift;
-
-      my $req = $tx->req;
-      if (my $error = $req->error) { $self->_debug($id, $error->{message}) }
-
-      # WebSocket
-      if ($req->is_handshake) {
-        my $ws = $self->{connections}{$id}{next}
-          = Mojo::Transaction::WebSocket->new(handshake => $tx);
-        $self->emit(request => server_handshake $ws);
-      }
-
-      # HTTP
-      else { $self->emit(request => $tx) }
-
-      # Last keep-alive request or corrupted connection
-      my $c = $self->{connections}{$id};
-      $tx->res->headers->connection('close')
-        if ($c->{requests} || 1) >= $self->max_requests || $req->error;
-
-      $tx->on(resume => sub { $self->_write($id) });
-      $self->_write($id);
-    }
-  );
-
-  # Kept alive if we have more than one request on the connection
-  return ++$c->{requests} > 1 ? $tx->kept_alive(1) : $tx;
-}
-
 sub _close {
   my ($self, $id) = @_;
-  if (my $tx = $self->{connections}{$id}{tx}) { $tx->closed }
+  $self->ioloop->remove($id);
   delete $self->{connections}{$id};
 }
 
 sub _debug { $_[0]->app->log->debug($_[2]) if $_[0]{connections}{$_[1]}{tx} }
-
-sub _finish {
-  my ($self, $id) = @_;
-
-  # Always remove connection for WebSockets
-  my $c = $self->{connections}{$id};
-  return unless my $tx = $c->{tx};
-  return $self->_remove($id) if $tx->is_websocket;
-
-  # Finish transaction
-  delete($c->{tx})->closed;
-
-  # Upgrade connection to WebSocket
-  if (my $ws = delete $c->{next}) {
-
-    # Successful upgrade
-    if ($ws->handshake->res->code == 101) {
-      $c->{tx} = $ws->established(1);
-      weaken $self;
-      $ws->on(resume => sub { $self->_write($id) });
-      $self->_write($id);
-    }
-
-    # Failed upgrade
-    else { $ws->closed }
-  }
-
-  # Close connection if necessary
-  return $self->_remove($id) if $tx->error || !$tx->keep_alive;
-
-  # Build new transaction for leftovers
-  return unless length(my $leftovers = $tx->req->content->leftovers);
-  $tx = $c->{tx} = $self->_build_tx($id, $c);
-  $tx->server_read($leftovers);
-}
 
 sub _listen {
   my ($self, $listen) = @_;
@@ -167,8 +94,11 @@ sub _listen {
   croak qq{Invalid listen location "$listen"}
     unless $proto eq 'http' || $proto eq 'https' || $proto eq 'http+unix';
 
-  my $query = $url->query;
-  my $options = {backlog => $self->backlog};
+  my $query   = $url->query;
+  my $options = {
+    backlog      => $self->backlog,
+    stream_class => 'Mojo::IOLoop::Stream::HTTPServer'
+  };
   $options->{$_} = $query->param($_) for qw(fd single_accept reuse);
   if ($proto eq 'http+unix') { $options->{path} = $url->host }
   else {
@@ -182,21 +112,31 @@ sub _listen {
   if (my $key  = $query->param('key'))  { $options->{'tls_key'}{''}  = $key }
   my $verify = $query->param('verify');
   $options->{tls_verify} = hex $verify if defined $verify;
-  my $tls = $options->{tls} = $proto eq 'https';
+  $options->{tls} = $proto eq 'https';
 
   weaken $self;
   push @{$self->acceptors}, $self->ioloop->server(
     $options => sub {
       my ($loop, $stream, $id) = @_;
 
-      $self->{connections}{$id} = {tls => $tls};
+      weaken $stream;
+      $self->{connections}{$id} = $stream;
       warn "-- Accept $id (@{[$stream->handle->peerhost]})\n" if DEBUG;
       $stream->timeout($self->inactivity_timeout);
+      $stream->max_requests($self->max_requests);
+
+      $stream->build_tx(sub { return $self->build_tx->connection($id) });
 
       $stream->on(close => sub { $self && $self->_close($id) });
       $stream->on(error =>
           sub { $self && $self->app->log->error(pop) && $self->_close($id) });
-      $stream->on(read => sub { $self->_read($id => pop) });
+      $stream->on(
+        request => sub {
+          my $req = pop;
+          if (my $error = $req->error) { $self->_debug($id, $error->{message}) }
+          $self->emit(request => $req);
+        }
+      );
       $stream->on(timeout => sub { $self->_debug($id, 'Inactivity timeout') });
     }
   );
@@ -206,39 +146,6 @@ sub _listen {
   $query->pairs([]);
   $url->host('127.0.0.1') if $url->host eq '*';
   say 'Server available at ', $options->{path} // $url;
-}
-
-sub _read {
-  my ($self, $id, $chunk) = @_;
-
-  # Make sure we have a transaction
-  my $c = $self->{connections}{$id};
-  my $tx = $c->{tx} ||= $self->_build_tx($id, $c);
-  warn term_escape "-- Server <<< Client (@{[_url($tx)]})\n$chunk\n" if DEBUG;
-  $tx->server_read($chunk);
-}
-
-sub _remove {
-  my ($self, $id) = @_;
-  $self->ioloop->remove($id);
-  $self->_close($id);
-}
-
-sub _url { shift->req->url->to_abs }
-
-sub _write {
-  my ($self, $id) = @_;
-
-  # Protect from resume event recursion
-  my $c = $self->{connections}{$id};
-  return if !(my $tx = $c->{tx}) || $c->{writing};
-  local $c->{writing} = 1;
-  my $chunk = $tx->server_write;
-  warn term_escape "-- Server >>> Client (@{[_url($tx)]})\n$chunk\n" if DEBUG;
-  my $next = $tx->is_finished ? '_finish' : length $chunk ? '_write' : undef;
-  return $self->ioloop->stream($id)->write($chunk) unless $next;
-  weaken $self;
-  $self->ioloop->stream($id)->write($chunk => sub { $self->$next($id) });
 }
 
 1;
@@ -457,13 +364,6 @@ Maximum number of accepted connections this server is allowed to handle
 concurrently, before stopping to accept new incoming connections, passed along
 to L<Mojo::IOLoop/"max_connections">.
 
-=head2 max_requests
-
-  my $max = $daemon->max_requests;
-  $daemon = $daemon->max_requests(250);
-
-Maximum number of keep-alive requests per connection, defaults to C<100>.
-
 =head2 silent
 
   my $bool = $daemon->silent;
@@ -475,6 +375,13 @@ Disable console messages.
 
 L<Mojo::Server::Daemon> inherits all methods from L<Mojo::Server> and
 implements the following new ones.
+
+=head2 max_requests
+
+  my $max = $daemon->max_requests;
+  $daemon = $daemon->max_requests(250);
+
+Maximum number of keep-alive requests per connection, defaults to C<100>.
 
 =head2 ports
 
