@@ -97,7 +97,8 @@ sub websocket_p {
 sub _cleanup {
   my $self = shift;
   delete $self->{pid};
-  $self->_finish($_, 1) for keys %{$self->{connections} || {}};
+  $self->_error($_, 'Premature connection close')
+    for keys %{$self->{connections} || {}};
   return $self;
 }
 
@@ -107,7 +108,10 @@ sub _connect {
   my $t = $self->transactor;
   my ($proto, $host, $port) = $peer ? $t->peer($tx) : $t->endpoint($tx);
 
-  my %options = (timeout => $self->connect_timeout);
+  my %options = (
+    timeout      => $self->connect_timeout,
+    stream_class => 'Mojo::IOLoop::Stream::HTTPClient'
+  );
   if ($proto eq 'http+unix') { $options{path} = $host }
   else                       { @options{qw(address port)} = ($host, $port) }
   if (my $local = $self->local_address) { $options{local_address} = $local }
@@ -136,10 +140,12 @@ sub _connect {
       return $self->_error($id, $err) if $err;
 
       # Connection established
+      $stream->transactor($self->transactor);
       $stream->on(timeout => sub { $self->_error($id, 'Inactivity timeout') });
       $stream->on(close => sub { $self && $self->_finish($id, 1) });
       $stream->on(error => sub { $self && $self->_error($id, pop) });
-      $stream->on(read => sub { $self->_read($id, pop) });
+      $stream->on(finish => sub { $self->_finish($id) });
+      $stream->on(upgrade => sub { $self->_upgrade($id, pop) });
       $self->$cb($id);
     }
   );
@@ -179,19 +185,10 @@ sub _connect_proxy {
 
 sub _connected {
   my ($self, $id) = @_;
-
   my $c      = $self->{connections}{$id};
-  my $stream = $c->{ioloop}->stream($id)->timeout($self->inactivity_timeout);
-  my $tx     = $c->{tx}->connection($id);
-  my $handle = $stream->handle;
-  unless ($handle->isa('IO::Socket::UNIX')) {
-    $tx->local_address($handle->sockhost)->local_port($handle->sockport);
-    $tx->remote_address($handle->peerhost)->remote_port($handle->peerport);
-  }
-
-  weaken $self;
-  $tx->on(resume => sub { $self->_write($id) });
-  $self->_write($id);
+  my $stream = $c->{ioloop}->stream($id)->timeout($self->inactivity_timeout)
+    ->request_timeout($self->request_timeout);
+  $stream->process($c->{tx}->connection($id));
 }
 
 sub _connection {
@@ -249,45 +246,14 @@ sub _error {
 sub _finish {
   my ($self, $id, $close) = @_;
 
-  # Remove request timeout and finish transaction
   return unless my $c = $self->{connections}{$id};
-  $c->{ioloop}->remove($c->{timeout}) if $c->{timeout};
-  return $self->_reuse($id, $close) unless my $old = $c->{tx};
+  return $self->_reuse($id, $close) unless my $tx = $c->{tx};
+  return $self->_remove($id) if $tx->is_websocket;
 
-  # Premature connection close
-  my $res = $old->closed->res->finish;
-  if ($close && !$res->code && !$res->error) {
-    $res->error({message => 'Premature connection close'});
-  }
+  $self->cookie_jar->collect($tx);
 
-  # Always remove connection for WebSockets
-  return $self->_remove($id) if $old->is_websocket;
-
-  $self->cookie_jar->collect($old);
-
-  # Upgrade connection to WebSocket
-  if (my $new = $self->transactor->upgrade($old)) {
-    weaken $self;
-    $new->on(resume => sub { $self->_write($id) });
-    $c->{cb}($self, $c->{tx} = $new);
-    return $new->client_read($old->res->content->leftovers);
-  }
-
-  # CONNECT requests always have a follow-up request
-  $self->_reuse($id, $close) unless uc $old->req->method eq 'CONNECT';
-  $res->error({message => $res->message, code => $res->code}) if $res->is_error;
-  $c->{cb}($self, $old) unless $self->_redirect($c, $old);
-}
-
-sub _read {
-  my ($self, $id, $chunk) = @_;
-
-  # Corrupted connection
-  return $self->_remove($id) unless my $tx = $self->{connections}{$id}{tx};
-
-  warn term_escape "-- Client <<< Server (@{[_url($tx)]})\n$chunk\n" if DEBUG;
-  $tx->client_read($chunk);
-  $self->_finish($id) if $tx->is_finished;
+  $self->_reuse($id, $close) unless uc $tx->req->method eq 'CONNECT';
+  $c->{cb}($self, $tx) unless $self->_redirect($c, $tx);
 }
 
 sub _redirect {
@@ -311,8 +277,7 @@ sub _reuse {
   my $c   = $self->{connections}{$id};
   my $tx  = delete $c->{tx};
   my $max = $self->max_connections;
-  return $self->_remove($id)
-    if $close || !$tx || !$max || !$tx->keep_alive || $tx->error;
+  return $self->_remove($id) if $close || !$tx || !$max;
 
   # Keep connection alive
   my $queue = $self->{queue}{$c->{ioloop}} ||= [];
@@ -336,31 +301,17 @@ sub _start {
   $tx->res->max_message_size($max) if defined $max;
 
   $self->emit(start => $tx);
-  return undef unless my $id = $self->_connection($loop, $tx, $cb);
-  if (my $timeout = $self->request_timeout) {
-    weaken $self;
-    $self->{connections}{$id}{timeout}
-      = $loop->timer($timeout => sub { $self->_error($id, 'Request timeout') });
-  }
+  return $self->_connection($loop, $tx, $cb);
+}
 
-  return $id;
+sub _upgrade {
+  my ($self, $id, $new) = @_;
+  return unless my $c = $self->{connections}{$id};
+  $self->cookie_jar->collect($new);
+  $c->{cb}($self, $c->{tx} = $new);
 }
 
 sub _url { shift->req->url->to_abs }
-
-sub _write {
-  my ($self, $id) = @_;
-
-  # Protect from resume event recursion
-  my $c = $self->{connections}{$id};
-  return if !(my $tx = $c->{tx}) || $c->{writing};
-  local $c->{writing} = 1;
-  my $chunk = $tx->client_write;
-  warn term_escape "-- Client >>> Server (@{[_url($tx)]})\n$chunk\n" if DEBUG;
-  return unless length $chunk;
-  weaken $self;
-  $c->{ioloop}->stream($id)->write($chunk => sub { $self->_write($id) });
-}
 
 1;
 
@@ -644,13 +595,13 @@ Proxy manager, defaults to a L<Mojo::UserAgent::Proxy> object.
   my $timeout = $ua->request_timeout;
   $ua         = $ua->request_timeout(5);
 
-Maximum amount of time in seconds establishing a connection, sending the
-request and receiving a whole response may take before getting canceled,
-defaults to the value of the C<MOJO_REQUEST_TIMEOUT> environment variable or
-C<0>. Setting the value to C<0> will allow the user agent to wait indefinitely.
-The timeout will reset for every followed redirect.
+Maximum amount of time in seconds sending the request and receiving a whole
+response may take before getting canceled, defaults to the value of the
+C<MOJO_REQUEST_TIMEOUT> environment variable or C<0>. This time does not include
+connection time. Setting the value to C<0> will allow the user agent to wait
+indefinitely. The timeout will reset for every followed redirect.
 
-  # Total limit of 5 seconds, of which 3 seconds may be spent connecting
+  # 3 seconds for connecting, than 5 seconds to process request
   $ua->max_redirects(0)->connect_timeout(3)->request_timeout(5);
 
 =head2 server
