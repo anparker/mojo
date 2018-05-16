@@ -220,7 +220,13 @@ Maximum number of keep-alive requests per connection, defaults to C<100>.
 =head1 METHODS
 
 Mojo::IOLoop::Stream::HTTPServer inherits all methods from
-L<Mojo::IOLoop::Stream>.
+L<Mojo::IOLoop::Stream> and implements the following new ones.
+
+=head2 new
+
+  my $stream = Mojo::IOLoop::Stream::HTTPServer->new($handle);
+
+Construct a new L<Mojo::IOLoop::Stream::HTTPServer> object.
 
 =head1 SEE ALSO
 
