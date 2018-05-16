@@ -49,6 +49,9 @@ sub acceptor {
 sub client {
   my ($self, $cb) = (_instance(shift), pop);
 
+  my $args = ref $_[0] ? $_[0] : {@_};
+  my $class = delete $args->{stream_class} || 'Mojo::IOLoop::Stream';
+
   my $id = $self->_id;
   my $client = $self->{out}{$id}{client} = Mojo::IOLoop::Client->new;
   weaken $client->reactor($self->reactor)->{reactor};
@@ -56,14 +59,15 @@ sub client {
   weaken $self;
   $client->on(
     connect => sub {
+      if (my $e = load_class $class) { die $e }
       delete $self->{out}{$id}{client};
-      my $stream = Mojo::IOLoop::Stream->new(pop);
+      my $stream = $class->new(pop);
       $self->_stream($stream => $id);
       $self->$cb(undef, $stream);
     }
   );
   $client->on(error => sub { $self->_remove($id); $self->$cb(pop, undef) });
-  $client->connect(@_);
+  $client->connect($args);
 
   return $id;
 }
@@ -107,14 +111,15 @@ sub reset {
 sub server {
   my ($self, $cb) = (_instance(shift), pop);
 
+  my $args = ref $_[0] ? $_[0] : {@_};
+  my $class = delete $args->{stream_class} || 'Mojo::IOLoop::Stream';
+
   my $server = Mojo::IOLoop::Server->new;
   weaken $self;
   $server->on(
     accept => sub {
-      my ($server, $handle) = @_;
-      my $class = $server->{args}{stream_class} || 'Mojo::IOLoop::Stream';
       if (my $e = load_class $class) { die $e }
-      my $stream = $class->new($handle);
+      my $stream = $class->new(pop);
       $self->$cb($stream, $self->_stream($stream, $self->_id, 1));
 
       # Enforce connection limit (randomize to improve load balancing)
@@ -127,7 +132,7 @@ sub server {
       $self->_not_accepting if $self->_limit;
     }
   );
-  $server->listen(@_);
+  $server->listen($args);
 
   return $self->acceptor($server);
 }
