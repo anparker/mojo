@@ -19,10 +19,6 @@ sub new {
   return $self;
 }
 
-sub _close {
-  $_[0]->{tx}->closed if $_[0]->{tx};
-}
-
 sub _build_tx {
   my $self = shift;
 
@@ -65,6 +61,10 @@ sub _build_tx {
 
   # Kept alive if we have more than one request on the connection
   return ++$self->{keep_alive} > 1 ? $tx->kept_alive(1) : $tx;
+}
+
+sub _close {
+  delete($_[0]->{tx})->closed if $_[0]->{tx};
 }
 
 sub _finish {
